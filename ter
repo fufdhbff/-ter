@@ -1,0 +1,196 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const { Client } = require('ssh2');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+// رندر مستقیم HTML و UI فرانت‌اند
+app.get('/', (req, res) => {
+  res.send(`
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web SSH Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            background-color: #121212;
+            color: #e0e0e0;
+            font-family: Tahoma, Segoe UI, sans-serif;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        .form-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px;
+            background: #1e1e1e;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        input, button {
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #333;
+            background: #2a2a2a;
+            color: #fff;
+            font-size: 14px;
+            outline: none;
+            direction: ltr;
+        }
+        input:focus { border-color: #007acc; }
+        button {
+            background: #007acc;
+            cursor: pointer;
+            border: none;
+            font-weight: bold;
+            transition: 0.2s;
+        }
+        button:hover { background: #005999; }
+        #status {
+            margin-bottom: 10px;
+            color: #888;
+            font-size: 0.9em;
+        }
+        #terminal-container {
+            width: 100%;
+            height: 550px;
+            background: #000;
+            padding: 8px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            direction: ltr;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h2>ترمینال تحت وب SSH</h2>
+        
+        <div class="form-container">
+            <input type="text" id="host" placeholder="IP / Host" value="">
+            <input type="number" id="port" placeholder="Port" value="22">
+            <input type="text" id="username" placeholder="Username" value="root">
+            <input type="password" id="password" placeholder="Password">
+            <button onclick="connectSSH()">اتصال به SSH</button>
+        </div>
+
+        <div id="status">وضعیت: آماده برای اتصال...</div>
+        <div id="terminal-container"></div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script>
+        const socket = io();
+        const term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: 'Courier New, monospace',
+            theme: { background: '#000000' }
+        });
+
+        term.open(document.getElementById('terminal-container'));
+
+        function connectSSH() {
+            const host = document.getElementById('host').value.trim();
+            const port = document.getElementById('port').value.trim();
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+
+            if (!host || !username || !password) {
+                alert('لطفاً تمامی فیلدهای لازم را پر کنید.');
+                return;
+            }
+
+            document.getElementById('status').innerText = 'وضعیت: در حال برقراری ارتباط...';
+            term.clear();
+
+            socket.emit('ssh-connect', { host, port, username, password });
+        }
+
+        term.onData(data => {
+            socket.emit('terminal-input', data);
+        });
+
+        socket.on('terminal-output', data => {
+            term.write(data);
+        });
+
+        socket.on('status', msg => {
+            document.getElementById('status').innerText = 'وضعیت: ' + msg;
+        });
+    </script>
+</body>
+</html>
+  `);
+});
+
+// مدیریت Socket.io و اتصالات SSH
+io.on('connection', (socket) => {
+    let sshClient = null;
+
+    socket.on('ssh-connect', (data) => {
+        if (sshClient) sshClient.end();
+
+        sshClient = new Client();
+        const { host, port, username, password } = data;
+
+        sshClient.on('ready', () => {
+            socket.emit('status', 'اتصال برقرار شد! در حال دریافت Shell...');
+            
+            sshClient.shell({ term: 'xterm-256color' }, (err, stream) => {
+                if (err) {
+                    socket.emit('status', 'خطا در ایجاد Shell: ' + err.message);
+                    return;
+                }
+
+                stream.on('data', (data) => {
+                    socket.emit('terminal-output', data.toString('binary'));
+                }).stderr.on('data', (data) => {
+                    socket.emit('terminal-output', data.toString('binary'));
+                });
+
+                socket.on('terminal-input', (inputData) => {
+                    stream.write(inputData);
+                });
+
+                stream.on('close', () => {
+                    sshClient.end();
+                    socket.emit('status', 'اتصال SSH قطع شد.');
+                });
+            });
+        }).on('error', (err) => {
+            socket.emit('status', 'خطا در اتصال: ' + err.message);
+        }).connect({
+            host: host,
+            port: parseInt(port) || 22,
+            username: username,
+            password: password,
+            readyTimeout: 20000
+        });
+    });
+
+    socket.on('disconnect', () => {
+        if (sshClient) sshClient.end();
+    });
+});
+
+// اجرای سرور با پورت متغیر برای Render
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`سرور فعال شد: http://localhost:${PORT}`);
+});
